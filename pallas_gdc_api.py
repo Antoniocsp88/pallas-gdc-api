@@ -3,29 +3,31 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote_plus
 
 import requests
 from fastapi import Body, FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # -----------------------------------------------------------------------------
 # App & Config
 # -----------------------------------------------------------------------------
 app = FastAPI(
     title="Pallas GDC API",
-    version="1.0.0",
+    version="1.1.0",
     description="Thin proxy over NCI GDC API with download helpers",
 )
 
-# (Optional) CORS for local UI/dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # internal use; restrict if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,15 +35,39 @@ app.add_middleware(
 
 GDC_BASE = "https://api.gdc.cancer.gov"
 GDC_STATUS = f"{GDC_BASE}/status"
-GDC_PROJECTS = f"{GDC_BASE}/projects"
-GDC_CASES = f"{GDC_BASE}/cases"
-GDC_FILES = f"{GDC_BASE}/files"
-GDC_ANNOTATIONS = f"{GDC_BASE}/annotations"
 GDC_DATA = f"{GDC_BASE}/data"
 GDC_MANIFEST = f"{GDC_BASE}/manifest"
 
+# Timeouts: (connect, read)
+TIMEOUT: Tuple[float, float] = (5.0, 60.0)
+
+# Bundle safety limits (tune for your Render plan). Keep functionality, prevent OOM.
+# Defaults are conservative and can be adjusted later.
+MAX_BUNDLE_FILES = int(__import__("os").getenv("MAX_BUNDLE_FILES", "25"))
+MAX_BUNDLE_TOTAL_BYTES = int(__import__("os").getenv("MAX_BUNDLE_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2 GiB
+MAX_BUNDLE_SINGLE_FILE_BYTES = int(
+    __import__("os").getenv("MAX_BUNDLE_SINGLE_FILE_BYTES", str(1 * 1024 * 1024 * 1024))
+)  # 1 GiB
+
+# If you ever want to disable bundling entirely without code changes:
+ENABLE_BUNDLE_DOWNLOADS = __import__("os").getenv("ENABLE_BUNDLE_DOWNLOADS", "true").lower() in ("1", "true", "yes")
+
+# -----------------------------------------------------------------------------
+# Requests session with retries/backoff (resilience)
+# -----------------------------------------------------------------------------
 SESSION = requests.Session()
-TIMEOUT = 60  # seconds
+_retry = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),  # we only use GET/POST here
+    raise_on_status=False,  # we handle status codes ourselves
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=20, pool_maxsize=20)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -73,13 +99,15 @@ def _gdc_get(path: str, params: Optional[Dict[str, Any]] = None) -> JSONResponse
     url = path if path.startswith("http") else f"{GDC_BASE}{path}"
     try:
         r = SESSION.get(url, params=params or {}, timeout=TIMEOUT)
-        r.raise_for_status()
+        # If upstream returns JSON error payload, surface it
+        if r.status_code >= 400:
+            try:
+                return JSONResponse(status_code=r.status_code, content=r.json())
+            except Exception:
+                raise HTTPException(status_code=502, detail=f"GDC error {r.status_code}: {r.text[:2000]}")
         return JSONResponse(content=r.json())
-    except requests.HTTPError as he:
-        try:
-            return JSONResponse(status_code=r.status_code, content=r.json())
-        except Exception:
-            raise HTTPException(status_code=502, detail=f"GDC error {r.status_code}: {he}")  # type: ignore
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
@@ -109,36 +137,10 @@ def _stream_gdc_file(file_id: str) -> Tuple[requests.Response, str]:
     r = SESSION.get(url, stream=True, timeout=TIMEOUT)
     if r.status_code == 404:
         raise HTTPException(status_code=404, detail=f"{file_id} not found")
-    try:
-        r.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"GDC data error ({file_id}): {e}")
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"GDC data error ({file_id}): {r.status_code} {r.text[:2000]}")
     fname = _filename_from_disposition(r.headers.get("Content-Disposition"), f"{file_id}.dat")
     return r, fname
-
-
-def _download_into_tar(ids: List[str]) -> bytes:
-    """
-    Download each file id from GDC /data/{id} and pack into a .tar bundle.
-    Returns the tar bytes.
-    """
-    buf = io.BytesIO()
-    with tarfile.open(mode="w", fileobj=buf) as tf:
-        for fid in ids:
-            resp, fname = _stream_gdc_file(fid)
-            file_bytes = io.BytesIO()
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    file_bytes.write(chunk)
-            size = file_bytes.tell()
-            file_bytes.seek(0)
-
-            info = tarfile.TarInfo(name=fname)
-            info.size = size
-            info.mtime = int(datetime.utcnow().timestamp())
-            tf.addfile(info, fileobj=file_bytes)
-    buf.seek(0)
-    return buf.read()
 
 
 def _ids_from_query(ids: Optional[List[str]] = None, ids_csv: Optional[str] = None) -> List[str]:
@@ -164,10 +166,124 @@ def _ids_from_query(ids: Optional[List[str]] = None, ids_csv: Optional[str] = No
     return uniq
 
 
+def _gdc_files_metadata(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch minimal metadata for a list of file_ids from GDC /files.
+    Returns dict: file_id -> {file_id, file_name, file_size}
+    """
+    if not file_ids:
+        return {}
+
+    filters = {"op": "in", "content": {"field": "files.file_id", "value": file_ids}}
+    # Note: for /files endpoint, field is just "file_id" (not files.file_id) in many schemas,
+    # but GDC generally accepts "file_id". We'll use "file_id" to be safe.
+    filters = {"op": "in", "content": {"field": "file_id", "value": file_ids}}
+
+    params = {
+        "filters": json.dumps(filters),
+        "fields": "file_id,file_name,file_size",
+        "size": len(file_ids),
+        "from": 0,
+    }
+    url = f"{GDC_BASE}/files"
+    r = SESSION.get(url, params=params, timeout=TIMEOUT)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"GDC /files metadata error: {r.status_code} {r.text[:2000]}")
+    payload = r.json()
+    hits = payload.get("data", {}).get("hits", [])
+    out: Dict[str, Dict[str, Any]] = {}
+    for h in hits:
+        fid = h.get("file_id") or h.get("id")
+        if fid:
+            out[str(fid)] = {
+                "file_id": str(fid),
+                "file_name": h.get("file_name"),
+                "file_size": h.get("file_size"),
+            }
+    return out
+
+
+def _enforce_bundle_limits(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Enforce bundle size and count limits using /files metadata.
+    Returns metadata dict if allowed.
+    """
+    if not ENABLE_BUNDLE_DOWNLOADS:
+        raise _bad_request("Bundle downloads are disabled on this server. Use /manifest + gdc-client or /data/{file_id}.")
+
+    if len(file_ids) > MAX_BUNDLE_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many files for bundle: {len(file_ids)} > {MAX_BUNDLE_FILES}. "
+                   f"Use /manifest and gdc-client, or split into smaller bundles.",
+        )
+
+    meta = _gdc_files_metadata(file_ids)
+    # If some ids weren't found in /files, fall back to trying downloads; but for safety, reject unknown.
+    missing = [fid for fid in file_ids if fid not in meta]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Some file_ids not found in GDC /files metadata: {missing[:10]}")
+
+    total = 0
+    for fid in file_ids:
+        sz = meta[fid].get("file_size")
+        if not isinstance(sz, int):
+            # If size missing, treat as unsafe for bundling.
+            raise HTTPException(status_code=502, detail=f"Missing file_size for {fid}; cannot safely bundle.")
+        if sz > MAX_BUNDLE_SINGLE_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Single file too large to bundle ({fid}: {sz} bytes). "
+                       f"Download individually via /data/{fid} or use /manifest + gdc-client.",
+            )
+        total += sz
+
+    if total > MAX_BUNDLE_TOTAL_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Bundle too large: {total} bytes > {MAX_BUNDLE_TOTAL_BYTES}. "
+                   f"Use /manifest and gdc-client, or split into smaller bundles.",
+        )
+
+    return meta
+
+
+def _download_into_tar(file_ids: List[str], meta: Optional[Dict[str, Dict[str, Any]]] = None) -> bytes:
+    """
+    Download each file id from GDC /data/{id} and pack into a .tar bundle.
+    NOTE: this is memory-heavy; we enforce strict limits before calling it.
+    Returns the tar bytes.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(mode="w", fileobj=buf) as tf:
+        for fid in file_ids:
+            resp, fname = _stream_gdc_file(fid)
+
+            # Prefer name from metadata when available (more stable than Content-Disposition)
+            if meta and fid in meta and meta[fid].get("file_name"):
+                fname = meta[fid]["file_name"]
+
+            file_bytes = io.BytesIO()
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    file_bytes.write(chunk)
+
+            size = file_bytes.tell()
+            file_bytes.seek(0)
+
+            info = tarfile.TarInfo(name=fname)
+            info.size = size
+            info.mtime = int(datetime.utcnow().timestamp())
+            tf.addfile(info, fileobj=file_bytes)
+
+    buf.seek(0)
+    return buf.read()
+
+
 def _stream_manifest_from_gdc(ids: List[str]) -> StreamingResponse:
     """
-    FIX: Generate a manifest by POSTing to upstream GDC /manifest with JSON body {"ids":[...]}.
-    This avoids the upstream 405 caused by GET /manifest?ids=...
+    Stream manifest from upstream GDC via POST /manifest with JSON {"ids":[...]}.
+    (Suggestion #3: streaming)
     """
     if not ids:
         raise _bad_request("Provide at least one file id.")
@@ -180,27 +296,18 @@ def _stream_manifest_from_gdc(ids: List[str]) -> StreamingResponse:
             timeout=TIMEOUT,
             headers={"Content-Type": "application/json"},
         )
-        # If upstream returns an error, surface it cleanly.
         if r.status_code >= 400:
-            # Try to parse JSON error; otherwise return text.
-            try:
-                err = r.json()
-                raise HTTPException(status_code=r.status_code, detail=err)
-            except Exception:
-                raise HTTPException(status_code=r.status_code, detail=r.text[:2000] or f"GDC error {r.status_code}")
+            # Forward upstream message
+            raise HTTPException(status_code=502, detail=f"GDC manifest error: {r.status_code} {r.text[:2000]}")
 
-        # Preserve upstream headers when possible
         dispo = r.headers.get("Content-Disposition") or r.headers.get("content-disposition")
         ctype = r.headers.get("Content-Type") or r.headers.get("content-type") or "text/plain; charset=utf-8"
-
-        # If no filename provided, set a reasonable default
         if not dispo:
             dispo = 'attachment; filename="gdc_manifest.txt"'
 
         headers = {"Content-Disposition": dispo}
 
         return StreamingResponse(r.iter_content(chunk_size=1024 * 64), media_type=ctype, headers=headers)
-
     except HTTPException:
         raise
     except Exception as e:
@@ -241,8 +348,11 @@ def root():
 def gdc_status():
     try:
         r = SESSION.get(GDC_STATUS, timeout=TIMEOUT)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"GDC status error: {r.status_code} {r.text[:2000]}")
         return JSONResponse(content=r.json())
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
@@ -334,27 +444,18 @@ def get_annotations(
     return _gdc_get("/annotations", params=params)
 
 
-# --- Manifest (FIXED) ---
-@app.post(
-    "/manifest",
-    responses={200: {"description": "GDC manifest (plain text) download"}},
-)
-def post_manifest(
-    payload: Dict[str, Any] = Body(..., description='JSON body like {"ids": ["id1","id2", ...]}'),
-):
+# --- Manifest (streaming) ---
+@app.post("/manifest", responses={200: {"description": "GDC manifest (plain text) download"}})
+def post_manifest(payload: Dict[str, Any] = Body(..., description='JSON body like {"ids": ["id1","id2", ...]}')):
     ids = payload.get("ids")
     if not isinstance(ids, list) or not all(isinstance(x, str) and x.strip() for x in ids):
         raise _bad_request('Body must be: {"ids": ["id1","id2", ...]}')
-    clean_ids = [x.strip() for x in ids]
-    return _stream_manifest_from_gdc(clean_ids)
+    clean = [x.strip() for x in ids]
+    return _stream_manifest_from_gdc(clean)
 
 
-@app.get(
-    "/manifest/{ids_csv}",
-    responses={200: {"description": "GDC manifest (plain text) download"}},
-)
+@app.get("/manifest/{ids_csv}", responses={200: {"description": "GDC manifest (plain text) download"}})
 def get_manifest(ids_csv: str = Path(..., description="One or more file_ids, comma-separated")):
-    # Convenience GET: /manifest/<uuid> or /manifest/<uuid1,uuid2,...>
     ids = [x.strip() for x in ids_csv.split(",") if x.strip()]
     return _stream_manifest_from_gdc(ids)
 
@@ -365,7 +466,7 @@ def slicing_url(file_id: str):
     return {"slice_url": f"{GDC_BASE}/slicing/view/{file_id}"}
 
 
-# --- Data: single file download ---
+# --- Data: single file download (streaming; safest for large files) ---
 @app.get("/data/{file_id}", responses={200: {"description": "File download"}})
 def get_data_file(file_id: str = Path(..., description="GDC file_id to download")):
     r, fname = _stream_gdc_file(file_id)
@@ -376,31 +477,34 @@ def get_data_file(file_id: str = Path(..., description="GDC file_id to download"
     return StreamingResponse(r.iter_content(chunk_size=1024 * 256), headers=headers)
 
 
-# --- Data: multiple files via GET ---
+# --- Data: multiple files via GET (bundle; guarded) ---
 @app.get("/data", responses={200: {"description": "Bundle download (.tar)"}})
 def get_data_bundle(
-    ids: Optional[List[str]] = Query(
-        None, description="Repeat ?ids=... for multiple ids, or a single comma-separated string"
-    ),
+    ids: Optional[List[str]] = Query(None, description="Repeat ?ids=... for multiple ids, or a single comma-separated string"),
     ids_csv: Optional[str] = Query(None, description="Alternative: comma-separated ids in one parameter (ids_csv)"),
 ):
     id_list = _ids_from_query(ids, ids_csv)
     if not id_list:
         raise _bad_request("Provide at least one 'ids' value (repeatable) or 'ids_csv' CSV list.")
-    tar_bytes = _download_into_tar(id_list)
+
+    meta = _enforce_bundle_limits(id_list)
+
+    tar_bytes = _download_into_tar(id_list, meta=meta)
     headers = {"Content-Disposition": 'attachment; filename="gdc_bundle.tar"'}
     return StreamingResponse(io.BytesIO(tar_bytes), media_type="application/x-tar", headers=headers)
 
 
-# --- Data: multiple files via POST (JSON body) ---
+# --- Data: multiple files via POST (bundle; guarded) ---
 @app.post("/data", responses={200: {"description": "Bundle download (.tar)"}})
-def post_data_bundle(
-    payload: Dict[str, Any] = Body(..., description='JSON body like {"ids": ["id1","id2", ...]}'),
-):
+def post_data_bundle(payload: Dict[str, Any] = Body(..., description='JSON body like {"ids": ["id1","id2", ...]}')):
     ids = payload.get("ids")
     if not isinstance(ids, list) or not all(isinstance(x, str) and x.strip() for x in ids):
         raise _bad_request('Body must be: {"ids": ["id1","id2", ...]}')
-    tar_bytes = _download_into_tar([x.strip() for x in ids])
+
+    id_list = [x.strip() for x in ids]
+    meta = _enforce_bundle_limits(id_list)
+
+    tar_bytes = _download_into_tar(id_list, meta=meta)
     headers = {"Content-Disposition": 'attachment; filename="gdc_bundle.tar"'}
     return StreamingResponse(io.BytesIO(tar_bytes), media_type="application/x-tar", headers=headers)
 
@@ -408,8 +512,8 @@ def post_data_bundle(
 # -----------------------------------------------------------------------------
 # Error normalization: convert RequestValidationError -> HTTP 400 (no 422s at runtime)
 # -----------------------------------------------------------------------------
-from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 
 
 @app.exception_handler(RequestValidationError)
@@ -419,9 +523,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return resp
 
 
-# production add ons
 if __name__ == "__main__":
-    import os, uvicorn
+    import os
+    import uvicorn
 
     uvicorn.run(
         "pallas_gdc_api:app",
