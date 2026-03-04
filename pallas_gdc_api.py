@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+ 
 import io
 import json
 import tarfile
@@ -18,7 +18,7 @@ from fastapi.openapi.utils import get_openapi
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Pallas GDC API", version="1.0.0", description="Thin proxy over NCI GDC API with download helpers")
 
-# (Optional) CORS for local UI/dev
+# (Optional) CORS for local UI/dev            qa
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
